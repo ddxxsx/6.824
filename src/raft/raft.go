@@ -55,7 +55,7 @@ type LogEntry struct {
 }
 
 const HEARTBEATPERIOD float64 = 100
-const APPENDCHECKPERIOD float64 = 100
+const APPENDCHECKPERIOD float64 = 10
 const TIMEOUTPERIOD float64 = 350
 
 // A Go object implementing a single Raft peer.
