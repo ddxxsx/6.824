@@ -56,7 +56,7 @@ type LogEntry struct {
 
 const HEARTBEATPERIOD float64 = 100
 const APPENDCHECKPERIOD float64 = 100
-const TIMEOUTPERIOD float64 = 300
+const TIMEOUTPERIOD float64 = 350
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -167,9 +167,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	VotedId int
-	TermId  int
-	LogLen  int
+	VotedId       int
+	TermId        int
+	LogLen        int
+	LastLogTermId int
 }
 
 // example RequestVote RPC reply structure.
@@ -190,19 +191,26 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if len(rf.Log) != 0 {
 		term = rf.Log[len(rf.Log)-1].Term
 	}
-
-	// Election Restrain
-	if args.TermId > term {
-		Log.Debug(Log.DVote, "S%d vote for S%d", rf.me, args.VotedId)
-		rf.LastVoted = args.VotedId
-		reply.Selected = true
-		return
-	} else {
-		if args.TermId == term && rf.LastVoted == -1 && args.LogLen >= len(rf.Log) {
+	if args.TermId > rf.TermId {
+		rf.TermId = args.TermId
+		rf.LastVoted = -1
+	}
+	if rf.LastVoted == -1 {
+		// Election Restrain
+		if args.LastLogTermId > term {
 			Log.Debug(Log.DVote, "S%d vote for S%d", rf.me, args.VotedId)
 			rf.LastVoted = args.VotedId
+			reply.Term = rf.TermId
 			reply.Selected = true
 			return
+		} else {
+			if args.LastLogTermId == term && rf.LastVoted == -1 && args.LogLen >= len(rf.Log) {
+				Log.Debug(Log.DVote, "S%d vote for S%d", rf.me, args.VotedId)
+				rf.LastVoted = args.VotedId
+				reply.Term = rf.TermId
+				reply.Selected = true
+				return
+			}
 		}
 	}
 
@@ -260,7 +268,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
-
+	if rf.Role != Leader {
+		return -1, -1, false
+	}
 	rf.mu.Lock()
 	index = len(rf.Log)
 	term = rf.TermId
@@ -268,7 +278,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.Role == Leader {
 		rf.Log = append(rf.Log, LogEntry{rf.TermId, command})
 	}
-	Log.Debug(Log.DLog, "S%d Start index[%d]term[%d]%t ", rf.me, index, term, isLeader)
+	Log.Debug(Log.DLog, "S%d Start index[%d]term[%d]leader[%t]value[%d] ", rf.me, index, term, isLeader, command)
 	rf.mu.Unlock()
 
 	// Your code here (2B).
@@ -337,13 +347,19 @@ func (rf *Raft) AppendTicker() {
 				index := rf.NextIndex[i] - 1
 				term := rf.Log[index].Term
 				log := rf.Log[index+1:]
-				args := AppendEntriesArgs{LeaderId: rf.me, Term: rf.TermId, PrevLogTerm: term, PrevLogIndex: index, Log: log}
+				//Log.Debug(Log.DLeader, "S%d index[%d],len[%d]sendlen[%d]", rf.me, index, len(rf.Log), len(log))
+				args := AppendEntriesArgs{LeaderId: rf.me, Term: rf.TermId, PrevLogTerm: term, PrevLogIndex: index, Log: log, LeaderCommit: rf.LastCommitId}
 
 				go func(i int) {
 					reply := AppendEntriesReply{}
-					Log.Debug(Log.DInfo, "S%d send AppendEntries to server[%d]", rf.me, i)
+
+					Log.Debug(Log.DInfo, "S%d send AppendEntries to [%d]", rf.me, i)
 					ret := rf.peers[i].Call("Raft.AppendEntries", &args, &reply)
-					Log.Debug(Log.DLog, "S%d get reply %t", rf.me, reply.Result)
+					if !ret {
+						//Log.Debug(Log.DLog, "S%d get no reply from[%d]", rf.me, i)
+						return
+					}
+					Log.Debug(Log.DLog, "S%d get reply from[%d] %t", rf.me, i, reply.Result)
 					if ret {
 						if !reply.Result {
 							// change NextIndex
@@ -360,7 +376,7 @@ func (rf *Raft) AppendTicker() {
 							}
 						} else {
 							//todo set success  add count,response to client
-							rf.NextIndex[i] = index + len(log)
+							rf.NextIndex[i] = index + len(log) + 1
 							CountLock.Lock()
 							SuccessCount++
 							if SuccessCount*2 > len(rf.peers) {
@@ -388,7 +404,7 @@ func (rf *Raft) CommitTicker() {
 		if rf.LastApplyId > rf.LastCommitId {
 			for i := rf.LastCommitId + 1; i <= rf.LastApplyId; i++ {
 				msg := ApplyMsg{CommandValid: true, Command: rf.Log[i].Command, CommandIndex: i}
-				Log.Debug(Log.DCommit, "S%d Commit index[%d]", rf.me, i)
+				Log.Debug(Log.DCommit, "S%d Commit index[%d] value[%v]", rf.me, i, msg.Command)
 				rf.ApplyCh <- msg
 				rf.LastCommitId = i
 			}
@@ -408,7 +424,7 @@ func (rf *Raft) AppendEntries(argc *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.TimeStamp = time.Now()
 
 	if rf.TermId > argc.Term {
-		Log.Debug(Log.DLog, "S%d AppendEntries false", rf.me)
+		Log.Debug(Log.DLog, "S%d AppendEntries false from [%d]", rf.me, argc.LeaderId)
 		reply.Result = false
 		reply.Term = rf.TermId
 		return
@@ -416,9 +432,10 @@ func (rf *Raft) AppendEntries(argc *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.TermId = argc.Term
 	if len(argc.Log) == 0 {
 		Log.Debug(Log.DInfo, "S%d heartbeat", rf.me)
-		return
+
+	} else {
+		Log.Debug(Log.DInfo, "S%d get AppendEntries from[%d] client term [%d]", rf.me, argc.LeaderId, rf.TermId)
 	}
-	Log.Debug(Log.DInfo, "S%d get AppendEntries from[%d] client term [%d]", rf.me, argc.LeaderId, rf.TermId)
 
 	if len(rf.Log)-1 < argc.PrevLogIndex {
 		//case log not exist
@@ -430,15 +447,14 @@ func (rf *Raft) AppendEntries(argc *AppendEntriesArgs, reply *AppendEntriesReply
 		AimTerm := rf.Log[argc.PrevLogIndex].Term
 		if AimTerm == argc.PrevLogTerm {
 			// matched
+			rf.Log = rf.Log[:argc.PrevLogIndex+1]
+
 			for i := range argc.Log {
-				if len(rf.Log)-1 >= argc.PrevLogIndex+i+1 {
-					rf.Log[argc.PrevLogIndex+i+1] = argc.Log[i]
-				} else {
-					rf.Log = append(rf.Log, argc.Log[i])
-				}
+				rf.Log = append(rf.Log, argc.Log[i])
 			}
 
-			rf.LastApplyId = len(rf.Log) - 1
+			//rf.LastApplyId = len(rf.Log) - 1
+			rf.LastApplyId = argc.LeaderCommit
 			reply.Result = true
 			return
 		} else {
@@ -464,11 +480,21 @@ func (rf *Raft) SendHeartBeat() {
 		for i := range rf.peers {
 			if i != rf.me {
 				go func(i int) {
-					Log.Debug(Log.DInfo, "S%d send heartbeat to [%d],term %d", rf.me, i, rf.TermId)
-					argc := AppendEntriesArgs{Term: rf.TermId, LeaderId: rf.me, LeaderCommit: rf.LastCommitId}
+					index := len(rf.Log) - 1
+					term := rf.Log[index].Term
+					Log.Debug(Log.DInfo, "S%d send heartbeat to [%d],term [%d]", rf.me, i, rf.TermId)
+					argc := AppendEntriesArgs{Term: rf.TermId, LeaderId: rf.me, LeaderCommit: rf.LastCommitId, PrevLogTerm: term, PrevLogIndex: index}
 					reply := AppendEntriesReply{}
-					rf.peers[i].Call("Raft.AppendEntries", &argc, &reply)
-
+					ret := rf.peers[i].Call("Raft.AppendEntries", &argc, &reply)
+					if !ret {
+						//Log.Debug(Log.DLog, "S%d send heartbeat to [%d] no return", rf.me, i)
+						return
+					}
+					if reply.Term > rf.TermId {
+						rf.TermId = reply.Term
+						rf.Role = Follower
+						rf.LastVoted = -1
+					}
 				}(i)
 			}
 		}
@@ -491,7 +517,9 @@ func (rf *Raft) StartElection() {
 			continue
 		}
 		go func(i int) {
-			argc := RequestVoteArgs{VotedId: rf.me, TermId: term, LogLen: len(rf.Log)}
+			LastLogIdx := len(rf.Log) - 1
+			LastLogTermId := rf.Log[LastLogIdx].Term
+			argc := RequestVoteArgs{VotedId: rf.me, TermId: term, LogLen: len(rf.Log), LastLogTermId: LastLogTermId}
 			reply := RequestVoteReply{}
 			if rf.TermId != term {
 				return
