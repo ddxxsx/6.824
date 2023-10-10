@@ -19,6 +19,8 @@ package raft
 
 import (
 	"6.5840/Log"
+	"6.5840/labgob"
+	"bytes"
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -131,12 +133,24 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	//rf.persister.Save(raftstate, nil)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(rf.Log) != nil || e.Encode(rf.TermId) != nil || e.Encode(rf.LastVoted) != nil {
+		Log.Debug(Log.DError, "S%d encode error", rf.me)
+	}
+
+	raftstate := w.Bytes()
+	//Log.Debug(Log.DInfo, "S%d save %v", rf.me, raftstate)
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
+	Log.Debug(Log.DPersist, "S%d read persist", rf.me)
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+		Log.Debug(Log.DWarn, "S%d return without any state", rf.me)
 		return
 	}
 	// Your code here (2C).
@@ -152,6 +166,22 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var logs []LogEntry
+	var termid int
+	var lastvote int
+
+	if d.Decode(&logs) != nil || d.Decode(&termid) != nil || d.Decode(&lastvote) != nil {
+		Log.Debug(Log.DError, "S%d decode error", rf.me)
+
+	} else {
+		rf.Log = logs
+		rf.TermId = termid
+		rf.LastVoted = lastvote
+		Log.Debug(Log.DInfo, "S%d LastVoted[%d],TermId[%d],log[%v]", rf.me, rf.LastVoted, rf.TermId, rf.Log)
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -202,6 +232,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.LastVoted = args.VotedId
 			reply.Term = rf.TermId
 			reply.Selected = true
+			rf.persist()
 			return
 		} else {
 			if args.LastLogTermId == term && rf.LastVoted == -1 && args.LogLen >= len(rf.Log) {
@@ -209,6 +240,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.LastVoted = args.VotedId
 				reply.Term = rf.TermId
 				reply.Selected = true
+				rf.persist()
 				return
 			}
 		}
@@ -272,14 +304,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index = len(rf.Log)
 	term = rf.TermId
 	isLeader = rf.Role == Leader
 	if rf.Role == Leader {
 		rf.Log = append(rf.Log, LogEntry{rf.TermId, command})
+		rf.persist()
 	}
 	Log.Debug(Log.DLog, "S%d Start index[%d]term[%d]leader[%t]value[%d] ", rf.me, index, term, isLeader, command)
-	rf.mu.Unlock()
 
 	// Your code here (2B).
 
@@ -329,25 +362,25 @@ func (rf *Raft) AppendTicker() {
 		if rf.killed() || rf.Role != Leader {
 			return
 		}
-		if rf.LastApplyId >= len(rf.Log)-1 {
-			continue
-		}
-		SuccessCount := 1
-		CountLock := sync.Mutex{}
+		//if rf.LastApplyId >= len(rf.Log)-1 {
+		//	continue
+		//}
+		//SuccessCount := 1
+		//CountLock := sync.Mutex{}
 		rf.mu.Lock()
 		for i := range rf.peers {
 			// check should send AppendEntries RPC
 			if rf.NextIndex[i] == len(rf.Log) && i != rf.me {
-				CountLock.Lock()
-				SuccessCount++
-				CountLock.Unlock()
+				//CountLock.Lock()
+				//SuccessCount++
+				//CountLock.Unlock()
 				continue
 			}
 			if i != rf.me {
 				index := rf.NextIndex[i] - 1
 				term := rf.Log[index].Term
 				log := rf.Log[index+1:]
-				//Log.Debug(Log.DLeader, "S%d index[%d],len[%d]sendlen[%d]", rf.me, index, len(rf.Log), len(log))
+				Log.Debug(Log.DLeader, "S%d index[%d],term[%d]commit[%d]", rf.me, index, term, rf.LastCommitId)
 				args := AppendEntriesArgs{LeaderId: rf.me, Term: rf.TermId, PrevLogTerm: term, PrevLogIndex: index, Log: log, LeaderCommit: rf.LastCommitId}
 
 				go func(i int) {
@@ -364,27 +397,33 @@ func (rf *Raft) AppendTicker() {
 						if !reply.Result {
 							// change NextIndex
 							if reply.XTerm == -1 {
-								rf.NextIndex[i] = index - reply.XLen
+								Log.Debug(Log.DInfo, "S%d idx[%d]Xlen[%d]", rf.me, index, reply.XLen)
+								rf.NextIndex[i] = index - reply.XLen + 1
 							} else {
 								for j := range rf.Log {
 									if rf.Log[j].Term == reply.XTerm {
 										rf.NextIndex[i] = j + 1
+										Log.Debug(Log.DInfo, "S%d j[%d]", rf.me, j+1)
+
 										return
 									}
 								}
+								Log.Debug(Log.DInfo, "S%d Xidx[%d]", rf.me, reply.XIndex)
+
 								rf.NextIndex[i] = reply.XIndex
 							}
 						} else {
 							//todo set success  add count,response to client
 							rf.NextIndex[i] = index + len(log) + 1
-							CountLock.Lock()
-							SuccessCount++
-							if SuccessCount*2 > len(rf.peers) {
-								SuccessCount = 0
-								rf.LastApplyId = index + len(log)
-								Log.Debug(Log.DLog, "S%d LastApplyId[%d]", rf.me, rf.LastApplyId)
-							}
-							CountLock.Unlock()
+							//CountLock.Lock()
+							//SuccessCount++
+							//if SuccessCount*2 > len(rf.peers) {
+							//	SuccessCount = 0
+							//	rf.LastApplyId = index + len(log)
+							//	Log.Debug(Log.DLog, "S%d LastApplyId[%d]", rf.me, rf.LastApplyId)
+							//}
+							//CountLock.Unlock()
+							rf.TryApplyLog(index + len(log))
 						}
 					}
 				}(i)
@@ -396,12 +435,28 @@ func (rf *Raft) AppendTicker() {
 
 }
 
+func (rf *Raft) TryApplyLog(idx int) {
+	SuccessCount := 1
+	for i := range rf.peers {
+		if rf.NextIndex[i] == len(rf.Log) && i != rf.me {
+			SuccessCount++
+			continue
+		}
+	}
+	if SuccessCount*2 > len(rf.peers) {
+		rf.LastApplyId = idx
+		Log.Debug(Log.DLog, "S%d LastApplyId[%d]", rf.me, rf.LastApplyId)
+
+	}
+}
+
 func (rf *Raft) CommitTicker() {
 	for !rf.killed() {
 		time.Sleep(time.Duration(APPENDCHECKPERIOD) * time.Millisecond)
 		rf.mu.Lock()
-		//Log.Debug(Log.DTimer, "S%d apply id[%d]commit id[%d]", rf.me, rf.LastApplyId, rf.LastCommitId)
 		if rf.LastApplyId > rf.LastCommitId {
+			Log.Debug(Log.DTimer, "S%d apply id[%d]commit id[%d]loglen[%d]", rf.me, rf.LastApplyId, rf.LastCommitId, len(rf.Log))
+
 			for i := rf.LastCommitId + 1; i <= rf.LastApplyId; i++ {
 				msg := ApplyMsg{CommandValid: true, Command: rf.Log[i].Command, CommandIndex: i}
 				Log.Debug(Log.DCommit, "S%d Commit index[%d] value[%v]", rf.me, i, msg.Command)
@@ -417,6 +472,7 @@ func (rf *Raft) AppendEntries(argc *AppendEntriesArgs, reply *AppendEntriesReply
 	//change role to follower
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	rf.Role = Follower
 	rf.LastVoted = -1
@@ -432,6 +488,7 @@ func (rf *Raft) AppendEntries(argc *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.TermId = argc.Term
 	if len(argc.Log) == 0 {
 		Log.Debug(Log.DInfo, "S%d heartbeat", rf.me)
+		//Log.Debug(Log.DInfo, "S%d log[%v],preidx[%d],prevterm[%d]", rf.me, rf.Log, argc.PrevLogIndex, argc.PrevLogTerm)
 
 	} else {
 		Log.Debug(Log.DInfo, "S%d get AppendEntries from[%d] client term [%d]", rf.me, argc.LeaderId, rf.TermId)
@@ -441,6 +498,7 @@ func (rf *Raft) AppendEntries(argc *AppendEntriesArgs, reply *AppendEntriesReply
 		//case log not exist
 		reply.Result = false
 		reply.XTerm = -1
+		Log.Debug(Log.DInfo, "S%d  loglen[%d] prevlogidx[%d]", rf.me, len(rf.Log), argc.PrevLogIndex)
 		reply.XLen = argc.PrevLogIndex + 1 - len(rf.Log)
 		return
 	} else {
@@ -494,7 +552,9 @@ func (rf *Raft) SendHeartBeat() {
 						rf.TermId = reply.Term
 						rf.Role = Follower
 						rf.LastVoted = -1
+						rf.persist()
 					}
+
 				}(i)
 			}
 		}
@@ -508,6 +568,7 @@ func (rf *Raft) StartElection() {
 	rf.Role = Candidates
 	rf.TimeStamp = time.Now()
 	term := rf.TermId
+	rf.persist()
 	rf.mu.Unlock()
 
 	VoteCount := 1
