@@ -36,6 +36,8 @@ type PutAppendReply struct {
 
 type GetArgs struct {
 	Key string
+	ClientID int64
+	Sequence int
 	// You'll have to add definitions here.
 }
 

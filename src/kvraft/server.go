@@ -28,6 +28,8 @@ type Op struct {
 	Command string
 	Key string
 	Value string
+	SequenceId int
+	ClientId int64
 }
 func (kv * KVServer)MemoryKVGet(key string) string {
 	//kv.mu.Lock()
@@ -73,7 +75,7 @@ type KVServer struct {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	op := Op{GET,args.Key,""}
+	op := Op{GET,args.Key,"",args.Sequence,args.ClientID}
 	index,_,leader:=kv.rf.Start(op)
 	reply.Err=""
 	reply.LeaderId = -1
@@ -91,6 +93,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 					kv.mu.Unlock()
 					reply.Value = value
 					reply.Err = OK
+				}else{
+					reply.Err= ErrWrongLeader
+					reply.LeaderId = kv.rf.LastVoted
 				}
 				break
 			case <-time.After(time.Duration(raft.TIMEOUTPERIOD)*time.Millisecond):
@@ -100,26 +105,33 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 }
-
+func (kv * KVServer) DuplicateRequest(ClientID int64,Sequence int) bool{
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	Seq,ok:=kv.ClientSeqMap[ClientID]
+	if !ok{
+		//kv.ClientSeqMap[ClientID]=Sequence -1
+		//Seq = kv.ClientSeqMap[ClientID]
+		return false
+	}else{
+		if Sequence<=Seq{
+			//reply.Err = ErrOldRequest
+			//reply.LeaderId = -1
+			return true
+		}
+	}
+	return false
+}
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-
-	kv.mu.Lock()
-	Seq,ok:=kv.ClientSeqMap[args.ClientID]
-	if !ok{
-		kv.ClientSeqMap[args.ClientID]=args.Sequence -1
-		Seq = kv.ClientSeqMap[args.ClientID]
-	}else{
-		if args.Sequence<=Seq{
-			reply.Err = ErrOldRequest
-			reply.LeaderId = -1
-			kv.mu.Unlock()
-			return
-		}
+	if kv.DuplicateRequest(args.ClientID,args.Sequence){
+		reply.Err = ErrOldRequest
+		reply.LeaderId = -1
+		return
 	}
-	kv.mu.Unlock()
-	op := Op{args.Op,args.Key,args.Value}
+
+	op := Op{args.Op,args.Key,args.Value,args.Sequence,args.ClientID}
 	index,_,leader:=kv.rf.Start(op)
 	reply.LeaderId = -1
 	reply.Err=OK
@@ -127,18 +139,15 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err= ErrWrongLeader
 		reply.LeaderId = kv.rf.LastVoted
 	}else{
-		Log.Debug(Log.DServer,"S%d Op:%s key:%s,v:%s",kv.me,args.Op,args.Key,args.Value)
 		ch := kv.GetIndexCh(index)
 		select {
 		case <-ch:
 			if _, Leader:=kv.rf.GetState(); Leader {
-				kv.mu.Lock()
-				kv.MemoryKVPutAppend(args.Key,args.Value,args.Op)
 				//kv.mu.Lock()
-				kv.ClientSeqMap[args.ClientID] = args.Sequence
-				kv.mu.Unlock()
-				Log.Debug(Log.DServer,"S%d after op:%s,v:%s",kv.me,args.Op,kv.MemoryKVGet(args.Key))
-
+				//kv.MemoryKVPutAppend(args.Key,args.Value,args.Op)
+				//kv.mu.Lock()
+				//kv.ClientSeqMap[args.ClientID] = args.Sequence
+				//kv.mu.Unlock()
 			}
 			break
 		case <-time.After(time.Duration(raft.TIMEOUTPERIOD)*time.Millisecond):
@@ -174,7 +183,26 @@ func (kv * KVServer) ProcessMsg() {
 		}
 		//Log.Debug(Log.DLog,"S%d Process before", kv.me)
 		msg:=<-kv.rf.ApplyCh
+
 		//Log.Debug(Log.DLog,"S%d Process after", kv.me)
+		op := msg.Command.(Op)
+		if op.Command==APPEND || op.Command==PUT{
+			if !kv.DuplicateRequest(op.ClientId,op.SequenceId){
+				Log.Debug(Log.DServer,"S%d Op:%s key:%s,v:%s,Clt:%v,Seq:%v",kv.me,op.Command,op.Key,op.Value,op.ClientId,op.SequenceId)
+				kv.mu.Lock()
+				kv.MemoryKVPutAppend(op.Key,op.Value,op.Command)
+				//kv.mu.Lock()
+				kv.ClientSeqMap[op.ClientId] = op.SequenceId
+				Log.Debug(Log.DServer,"S%d after op:%s,v:%s，client:%v,seq:%v",kv.me,op.Command,kv.MemoryKVGet(op.Key),op.ClientId,op.SequenceId)
+				kv.mu.Unlock()
+			}
+			//break
+		}else{
+			kv.mu.Lock()
+			kv.ClientSeqMap[op.ClientId] = op.SequenceId
+			kv.mu.Unlock()
+		}
+
 		ch := kv.GetIndexCh(msg.CommandIndex)
 		ch <- msg
 	}

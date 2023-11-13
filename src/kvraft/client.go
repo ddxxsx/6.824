@@ -49,7 +49,7 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	Log.Debug(Log.DClient,"C%d get k:%s",ck.ClientId,key)
 	for {
-		args:= GetArgs{key}
+		args:= GetArgs{key,ck.ClientId,ck.Sequence}
 		reply:=GetReply{}
 		ok := ck.servers[ck.LeaderId].Call("KVServer.Get",&args,&reply)
 		if !ok{
