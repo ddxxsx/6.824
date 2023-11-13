@@ -57,8 +57,8 @@ type LogEntry struct {
 }
 
 const HEARTBEATPERIOD float64 = 100
-const APPENDCHECKPERIOD float64 = 10
-const TIMEOUTPERIOD float64 = 350
+const APPENDCHECKPERIOD int = 10
+const TIMEOUTPERIOD int = 350
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -361,7 +361,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.Log = append(rf.Log, LogEntry{rf.TermId, command})
 		rf.persist()
 	}
-	Log.Debug(Log.DLog, "S%d Start index[%d]term[%d]leader[%t]value[%d] ", rf.me, index, term, isLeader, command)
+	Log.Debug(Log.DLog, "S%d Start index[%d]term[%d]leader %t value[%v] ", rf.me, index, term, isLeader, command)
 
 	// Your code here (2B).
 
@@ -507,8 +507,6 @@ func (rf *Raft) AppendTicker() {
 									for j := range rf.Log {
 										if rf.Log[j].Term == reply.XTerm {
 											rf.NextIndex[i] = j + 1 +LastIncludedIndex
-											Log.Debug(Log.DInfo, "S%d j[%d]", rf.me, j+1)
-
 											return
 										}
 									}
