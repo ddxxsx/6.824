@@ -191,7 +191,6 @@ func (rf *Raft) readPersist(data []byte) {
 	var term int
 	if d.Decode(&logs) != nil || d.Decode(&termid) != nil || d.Decode(&lastvote) != nil ||d.Decode(&index)!= nil||d.Decode(&term)!=nil{
 		Log.Debug(Log.DError, "S%d decode error", rf.me)
-
 	} else {
 		rf.Log = logs
 		rf.TermId = termid
@@ -271,6 +270,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.TermId > rf.TermId {
 		rf.TermId = args.TermId
 		rf.LastVoted = -1
+		if rf.Role!= Follower{
+			rf.Role = Follower
+		}
 	}
 	if rf.LastVoted == -1 {
 		// Election Restrain
@@ -348,12 +350,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	isLeader := true
 	if rf.Role != Leader {
 		return -1, -1, false
 	}
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	index = len(rf.Log)+rf.LastIncludedIndex
 	term = rf.TermId
 	isLeader = rf.Role == Leader
@@ -362,6 +364,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 	}
 	Log.Debug(Log.DLog, "S%d Start index[%d]term[%d]leader %t value[%v] ", rf.me, index, term, isLeader, command)
+	Log.Debug(Log.DLog,"S%d after start [%d]",rf.me, len(rf.Log)+rf.LastIncludedIndex)
 
 	// Your code here (2B).
 
@@ -468,23 +471,23 @@ func (rf *Raft) AppendTicker() {
 							rf.TermId = reply.Term
 						}else if reply.Term != -1{
 							rf.NextIndex[i] = rf.LastIncludedIndex +1
+							Log.Debug(Log.DLeader, "S%d i:%d NextIndex[%d]", rf.me,i, rf.NextIndex[i])
 						}
 					}
 				}(i)
 			} else
 			{
 				if i != rf.me {
+					Log.Debug(Log.DLeader, "S%d i:%d index[%d],apply[%d],lstInclude[%d],term:[%d]", rf.me,i, rf.NextIndex[i]-1, rf.LastCommitId,rf.LastIncludedIndex,rf.TermId)
 					index := rf.NextIndex[i] - 1-rf.LastIncludedIndex
 					term := rf.Log[index].Term
 					log := rf.Log[index+1:]
-					Log.Debug(Log.DLeader, "S%d index[%d],term[%d]apply[%d]", rf.me, index+rf.LastIncludedIndex, term, rf.LastCommitId)
 					args := AppendEntriesArgs{LeaderId: rf.me, Term: rf.TermId, PrevLogTerm: term, PrevLogIndex: index+rf.LastIncludedIndex, Log: log, LeaderApply: rf.LastApplyId}
-
+					LastIncludedIndex := rf.LastIncludedIndex
 					go func(i int) {
 						reply := AppendEntriesReply{}
 
 						Log.Debug(Log.DInfo, "S%d send AppendEntries to [%d]", rf.me, i)
-						LastIncludedIndex := rf.LastIncludedIndex
 						ret := rf.peers[i].Call("Raft.AppendEntries", &args, &reply)
 						if !ret {
 							//Log.Debug(Log.DLog, "S%d get no reply from[%d]", rf.me, i)
@@ -503,20 +506,23 @@ func (rf *Raft) AppendTicker() {
 								if reply.XTerm == -1 {
 									Log.Debug(Log.DInfo, "S%d idx[%d]Xlen[%d]", rf.me, index, reply.XLen)
 									rf.NextIndex[i] = index - reply.XLen + 1 + LastIncludedIndex
+									Log.Debug(Log.DLeader, "S%d i:%d NextIndex[%d]", rf.me,i, rf.NextIndex[i])
 								} else {
 									for j := range rf.Log {
 										if rf.Log[j].Term == reply.XTerm {
 											rf.NextIndex[i] = j + 1 +LastIncludedIndex
+											Log.Debug(Log.DLeader, "S%d i:%d NextIndex[%d]", rf.me,i, rf.NextIndex[i])
 											return
 										}
 									}
 									Log.Debug(Log.DInfo, "S%d Xidx[%d]", rf.me, reply.XIndex)
-
 									rf.NextIndex[i] = reply.XIndex + LastIncludedIndex
+									Log.Debug(Log.DLeader, "S%d i:%d NextIndex[%d]", rf.me,i, rf.NextIndex[i])
 								}
 							} else {
 								Log.Debug(Log.DLog,"S%d reply idx[%d],loglen[%d],lastInlcude[%d]",rf.me,index,len(log),LastIncludedIndex)
 								rf.NextIndex[i] = index + len(log) + 1 + LastIncludedIndex
+								Log.Debug(Log.DLeader, "S%d i:%d NextIndex[%d]", rf.me,i, rf.NextIndex[i])
 								rf.TryApplyLog(index + len(log)+LastIncludedIndex)
 							}
 						}
@@ -541,6 +547,7 @@ func (rf *Raft) TryApplyLog(idx int) {
 	}
 	if SuccessCount*2 > len(rf.peers) {
 		rf.LastApplyId = idx
+		Log.Debug(Log.DLog,"S%d LogLen%d,LastInclude%d",rf.me, len(rf.Log),rf.LastIncludedIndex)
 		Log.Debug(Log.DLog, "S%d LastApplyId[%d]", rf.me, rf.LastApplyId)
 
 	}
@@ -584,7 +591,7 @@ func (rf *Raft) AppendEntries(argc *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.LastVoted = -1
 	//Log.Debug(Log.DLog, "S%d TimeStamp change", rf.me)
 	rf.TimeStamp = time.Now()
-
+	Log.Debug(Log.DLog, "S%d argc term[%d]", rf.me,argc.Term)
 	if rf.TermId > argc.Term {
 		Log.Debug(Log.DLog, "S%d AppendEntries false from [%d]", rf.me, argc.LeaderId)
 		reply.Result = false

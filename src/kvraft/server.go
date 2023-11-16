@@ -5,6 +5,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -70,6 +71,8 @@ type KVServer struct {
 	KV map[string]string
 	MsgChanMap map[int]chan raft.ApplyMsg
 	ClientSeqMap map[int64]int
+
+	persister * raft.Persister
 }
 
 
@@ -184,30 +187,78 @@ func (kv * KVServer) ProcessMsg() {
 		//Log.Debug(Log.DLog,"S%d Process before", kv.me)
 		msg:=<-kv.rf.ApplyCh
 
-		//Log.Debug(Log.DLog,"S%d Process after", kv.me)
-		op := msg.Command.(Op)
-		if op.Command==APPEND || op.Command==PUT{
-			if !kv.DuplicateRequest(op.ClientId,op.SequenceId){
-				Log.Debug(Log.DServer,"S%d Op:%s key:%s,v:%s,Clt:%v,Seq:%v",kv.me,op.Command,op.Key,op.Value,op.ClientId,op.SequenceId)
+		if msg.CommandValid{
+			//Log.Debug(Log.DLog,"S%d Process after", kv.me)
+			op := msg.Command.(Op)
+			if op.Command==APPEND || op.Command==PUT{
+				if !kv.DuplicateRequest(op.ClientId,op.SequenceId){
+					Log.Debug(Log.DServer,"S%d Op:%s key:%s,v:%s,Clt:%v,Seq:%v",kv.me,op.Command,op.Key,op.Value,op.ClientId,op.SequenceId)
+					kv.mu.Lock()
+					kv.MemoryKVPutAppend(op.Key,op.Value,op.Command)
+					//kv.mu.Lock()
+					kv.ClientSeqMap[op.ClientId] = op.SequenceId
+					Log.Debug(Log.DServer,"S%d after op:%s,v:%s，client:%v,seq:%v",kv.me,op.Command,kv.MemoryKVGet(op.Key),op.ClientId,op.SequenceId)
+					kv.mu.Unlock()
+				}
+				//break
+				if kv.NeedSnapShot(){
+					kv.MakeSnapShot(msg.CommandIndex)
+				}
+
+			}else{
 				kv.mu.Lock()
-				kv.MemoryKVPutAppend(op.Key,op.Value,op.Command)
-				//kv.mu.Lock()
 				kv.ClientSeqMap[op.ClientId] = op.SequenceId
-				Log.Debug(Log.DServer,"S%d after op:%s,v:%s，client:%v,seq:%v",kv.me,op.Command,kv.MemoryKVGet(op.Key),op.ClientId,op.SequenceId)
 				kv.mu.Unlock()
 			}
-			//break
-		}else{
-			kv.mu.Lock()
-			kv.ClientSeqMap[op.ClientId] = op.SequenceId
-			kv.mu.Unlock()
-		}
 
-		ch := kv.GetIndexCh(msg.CommandIndex)
-		ch <- msg
+
+			ch := kv.GetIndexCh(msg.CommandIndex)
+			ch <- msg
+		}else if msg.SnapshotValid{
+			kv.ApplySnapShot(msg.Snapshot)
+		}
 	}
 }
+func (kv * KVServer)ApplySnapShot(SnapShot []byte){
+	if SnapShot == nil || len(SnapShot) < 1 {
+		//DPrintf(11111, "持久化数据为空！")
+		Log.Debug(Log.DServer,"S%d snap nil",kv.me)
+		return
+	}
+	r := bytes.NewBuffer(SnapShot)
+	d := labgob.NewDecoder(r)
+
+	kv.mu.Lock()
+	var KV map[string]string
+	var ClntMap map[int64]int
+
+	if d.Decode(&ClntMap) != nil || d.Decode(&KV) != nil {
+		Log.Debug(Log.DError, "S%d ApplySnapShot decode error", kv.me)
+	}
+	kv.KV=KV
+	kv.ClientSeqMap=ClntMap
+	kv.mu.Unlock()
+}
+func (kv *KVServer)MakeSnapShot(idx int){
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(kv.ClientSeqMap)!=nil|| e.Encode(kv.KV)!=nil{
+		Log.Debug(Log.DServer, "S%d makesnapshot encode error", kv.me)
+	}
+	SnapShot:=w.Bytes()
+	kv.rf.Snapshot(idx,SnapShot)
+}
+
+
+func (kv * KVServer)NeedSnapShot() bool {
+	if kv.maxraftstate==-1{
+		return false
+	}
+	return kv.persister.RaftStateSize()>=kv.maxraftstate
+}
 func (kv * KVServer)GetIndexCh(index int) chan raft.ApplyMsg{
+	kv.mu.Lock()
+	defer  kv.mu.Unlock()
 	ch,ret:= kv.MsgChanMap[index]
 	if ret{
 		return ch
@@ -247,6 +298,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.KV = make(map[string]string)
 	kv.MsgChanMap = make(map[int]chan raft.ApplyMsg)
 	kv.ClientSeqMap = make(map[int64]int)
+	kv.persister = persister
+	kv.ApplySnapShot(persister.ReadSnapshot())
+	//persister.ReadSnapshot()
 	go kv.ProcessMsg()
 	// You may need initialization code here.
 
