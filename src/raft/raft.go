@@ -226,7 +226,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		}
 	}
 	temp := make([]LogEntry, 1)
-	temp[0].Term = rf.Log[len(rf.Log)-1].Term
+	//temp[0].Term = rf.Log[len(rf.Log)-1].Term
+	temp[0].Term = rf.Log[rf.LastIncludedIndex-oldIndex].Term
 	rf.Log = append(temp, rf.Log[rf.LastIncludedIndex-oldIndex+1:]...)
 	//Log.Debug(Log.DSnap,"S%d snap len[%d][%d]",rf.me, len(rf.Log),oldIndex)
 	w := new(bytes.Buffer)
@@ -411,7 +412,7 @@ func (rf *Raft) ticker() {
 func (rf *Raft) InstallSnapShot(args *InstallSnapShotArgs, reply *InstallSnapShotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	Log.Debug(Log.DSnap, "S%d InstallSnapShot", rf.me)
+	Log.Debug(Log.DSnap, "S%d InstallSnapShot argcindx[%d]", rf.me, args.LastIncludedIndex)
 	reply.Term = -1
 	if args.Term < rf.TermId {
 		reply.Term = rf.TermId
@@ -421,6 +422,17 @@ func (rf *Raft) InstallSnapShot(args *InstallSnapShotArgs, reply *InstallSnapSho
 	rf.Role = Follower
 	rf.TimeStamp = time.Now()
 	rf.TermId = args.Term
+	if rf.LastIncludedIndex >= args.LastIncludedIndex {
+		return
+	}
+	if len(rf.Log)+rf.LastIncludedIndex <= args.LastIncludedIndex {
+		rf.Log = make([]LogEntry, 1)
+	} else {
+		var tmp []LogEntry
+		rf.Log = append(tmp, rf.Log[args.LastIncludedIndex-rf.LastIncludedIndex:]...)
+	}
+
+	rf.Log[0].Term = args.LastIncludedTerm
 	rf.LastIncludedIndex = args.LastIncludedIndex
 	rf.LastIncludedTerm = args.LastIncludedTerm
 	rf.LastApplyId, rf.LastCommitId = args.LastIncludedIndex, args.LastIncludedIndex
@@ -428,8 +440,7 @@ func (rf *Raft) InstallSnapShot(args *InstallSnapShotArgs, reply *InstallSnapSho
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	//if (args.LastIncludedIndex>=rf.LastIncludedIndex)
-	rf.Log = make([]LogEntry, 1)
-	rf.Log[0].Term = rf.LastIncludedTerm
+
 	if e.Encode(rf.Log) != nil || e.Encode(rf.TermId) != nil || e.Encode(rf.LastVoted) != nil || e.Encode(rf.LastIncludedIndex) != nil || e.Encode(rf.LastIncludedTerm) != nil {
 		Log.Debug(Log.DError, "S%d encode error", rf.me)
 	}
@@ -448,12 +459,12 @@ func (rf *Raft) AppendTicker() {
 		}
 		for i := range rf.peers {
 			// check should send AppendEntries RPC
+			rf.mu.Lock()
 			if rf.NextIndex[i] == len(rf.Log)+rf.LastIncludedIndex && i != rf.me {
-				//CountLock.Lock()
-				//SuccessCount++
-				//CountLock.Unlock()
+				rf.mu.Unlock()
 				continue
 			}
+			rf.mu.Unlock()
 
 			go func(i int) {
 				if rf.NextIndex[i] <= rf.LastIncludedIndex && rf.me != i {
@@ -478,6 +489,7 @@ func (rf *Raft) AppendTicker() {
 								Log.Debug(Log.DLeader, "S%d i:%d NextIndex[%d]", rf.me, i, rf.NextIndex[i])
 							}
 							rf.mu.Unlock()
+							return
 						}
 					}
 				} else {
@@ -645,6 +657,9 @@ func (rf *Raft) AppendEntries(argc *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XLen = argc.PrevLogIndex + 1 - len(rf.Log) - rf.LastIncludedIndex
 		return
 	} else {
+		if argc.PrevLogIndex < rf.LastIncludedIndex {
+			return
+		}
 		AimTerm := rf.Log[argc.PrevLogIndex-rf.LastIncludedIndex].Term
 		Log.Debug(Log.DInfo, "S%d AimTerm[%d],prevTerm[%d]", rf.me, AimTerm, argc.PrevLogTerm)
 		if AimTerm == argc.PrevLogTerm {
