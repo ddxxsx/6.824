@@ -16,7 +16,7 @@ def run_tests(Debug,Test,Start,End):
         #                      stdout=subprocess.PIPE,
         #                      stderr=subprocess.STDOUT
         #                      )
-def divide_into_intervals(number, parts=5):
+def divide_into_intervals(number, parts=10):
     interval = number // parts
     intervals = []
 
